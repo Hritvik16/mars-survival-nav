@@ -1,0 +1,41 @@
+{
+  "site_id": "deuteronilus",
+  "name": "Deuteronilus Mensae (Fretted Glacial Dichotomy)",
+  "coords_label": "43.90°N, 22.60°E (-3,800m MOLA)",
+  "center_lat_lon": [
+    43.9,
+    22.6
+  ],
+  "base_datum_meters": -3800,
+  "sector_size_meters": 2048,
+  "hab_grid_coords": [
+    24,
+    64
+  ],
+  "channels": [
+    {
+      "id": "elevation",
+      "file": "elevation.bin",
+      "dtype": "float32",
+      "width": 128,
+      "height": 128,
+      "unit": "m"
+    },
+    {
+      "id": "thermal_inertia",
+      "file": "thermal.bin",
+      "dtype": "uint16",
+      "width": 64,
+      "height": 64,
+      "unit": "TIU"
+    },
+    {
+      "id": "geologic_unit",
+      "file": "geologic.bin",
+      "dtype": "uint8",
+      "width": 64,
+      "height": 64,
+      "unit": "class"
+    }
+  ]
+}

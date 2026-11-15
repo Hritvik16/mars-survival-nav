@@ -1,0 +1,41 @@
+{
+  "site_id": "phlegra_pm1",
+  "name": "Phlegra Montes (Lobate Debris Apron PM-1)",
+  "coords_label": "39.80°N, 163.20°E (-3,600m MOLA)",
+  "center_lat_lon": [
+    39.8,
+    163.2
+  ],
+  "base_datum_meters": -3600,
+  "sector_size_meters": 2048,
+  "hab_grid_coords": [
+    18,
+    100
+  ],
+  "channels": [
+    {
+      "id": "elevation",
+      "file": "elevation.bin",
+      "dtype": "float32",
+      "width": 128,
+      "height": 128,
+      "unit": "m"
+    },
+    {
+      "id": "thermal_inertia",
+      "file": "thermal.bin",
+      "dtype": "uint16",
+      "width": 64,
+      "height": 64,
+      "unit": "TIU"
+    },
+    {
+      "id": "geologic_unit",
+      "file": "geologic.bin",
+      "dtype": "uint8",
+      "width": 64,
+      "height": 64,
+      "unit": "class"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "site_id": "arcadia_ap1",
+  "name": "Arcadia Planitia (Starship Candidate Site AP-1)",
+  "coords_label": "39.09°N, 189.79°E (-4,200m MOLA)",
+  "center_lat_lon": [
+    39.09,
+    189.79
+  ],
+  "base_datum_meters": -4200,
+  "sector_size_meters": 2048,
+  "hab_grid_coords": [
+    64,
+    64
+  ],
+  "channels": [
+    {
+      "id": "elevation",
+      "file": "elevation.bin",
+      "dtype": "float32",
+      "width": 128,
+      "height": 128,
+      "unit": "m"
+    },
+    {
+      "id": "thermal_inertia",
+      "file": "thermal.bin",
+      "dtype": "uint16",
+      "width": 64,
+      "height": 64,
+      "unit": "TIU"
+    },
+    {
+      "id": "geologic_unit",
+      "file": "geologic.bin",
+      "dtype": "uint8",
+      "width": 64,
+      "height": 64,
+      "unit": "class"
+    }
+  ]
+}
