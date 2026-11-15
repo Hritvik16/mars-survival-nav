@@ -78,6 +78,8 @@ export interface DiscoveryHotspot {
 export interface RouteResult {
   readonly found: boolean;
   readonly pathIndices: Int32Array;
+  readonly roverPathIndices?: Int32Array;
+  readonly rendezvousCoord?: readonly [number, number];
   readonly pathCepMeters: Float32Array;
   readonly maxCepMeters: number;
   readonly minIceDepthMeters: number;
@@ -131,12 +133,10 @@ export class AnisotropicPathfinder {
     this.heap = new Int32Array(maxCells);
   }
 
-  /** Marks or clears a 5x5 cell In-Situ Hazard Block discovered by the astronaut mid-EVA */
   public toggleInSituHazard(sector: SectorBuffers, col: number, row: number): boolean {
     const { gridSize, inSituBlocked, site } = sector;
     if (Math.hypot(col - site.habCol, row - site.habRow) <= 3) return false;
 
-    // If any cell within 4 cells is already blocked, clear the entire nearby hazard patch
     let hasNearby = false;
     for (let dr = -4; dr <= 4; dr++) {
       for (let dc = -4; dc <= 4; dc++) {
@@ -208,6 +208,144 @@ export class AnisotropicPathfinder {
       startSolHour,
       false
     );
+  }
+
+  /**
+   * Multimodal Steiner Rendezvous Solver (Hab ==Rover==> R* --Foot Scramble--> Target):
+   * Wheeled rover hauls heavy payloadMassKg along gentle terrain (<=15.5 deg, TIU >= 130) to an
+   * optimal drop-off basecamp R*, and astronaut scrambles R* -> Target carrying only 2.2kg hand tools.
+   */
+  public findRoverAssistedRoute(
+    sector: SectorBuffers,
+    startCol: number,
+    startRow: number,
+    goalCol: number,
+    goalRow: number,
+    payloadMassKg = 15.5,
+    startSolHour = 14.0
+  ): RouteResult {
+    const t0 = performance.now();
+    const {
+      gridSize,
+      worldSizeMeters,
+      elevation,
+      slopeDeg,
+      thermalInertia,
+      roughness,
+      inSituBlocked,
+    } = sector;
+    const cellStep = worldSizeMeters / (gridSize - 1);
+
+    const roverCost = new Float32Array(gridSize * gridSize).fill(Infinity);
+    const roverParent = new Int32Array(gridSize * gridSize).fill(-1);
+    this.fScore.fill(Infinity);
+    this.closed.fill(0);
+    this.heapSize = 0;
+
+    const startIdx = startRow * gridSize + startCol;
+    roverCost[startIdx] = 0;
+    this.fScore[startIdx] = 0;
+    this.pushHeap(startIdx);
+
+    while (this.heapSize > 0) {
+      const curr = this.popHeap();
+      if (this.closed[curr]) continue;
+      this.closed[curr] = 1;
+
+      const cr = Math.floor(curr / gridSize);
+      const cc = curr % gridSize;
+      const zCurr = elevation[curr];
+
+      for (let d = 0; d < 8; d++) {
+        const nc = cc + DIRS[d][0];
+        const nr = cr + DIRS[d][1];
+        if (nc < 1 || nc >= gridSize - 1 || nr < 1 || nr >= gridSize - 1) continue;
+        const nextIdx = nr * gridSize + nc;
+        if (this.closed[nextIdx] || inSituBlocked[nextIdx] === 1) continue;
+
+        if (
+          slopeDeg[nextIdx] > 15.5 ||
+          thermalInertia[nextIdx] < 130 ||
+          roughness[nextIdx] > 0.45
+        ) {
+          continue;
+        }
+
+        const stepDist = DIRS[d][2] * cellStep;
+        const dz = Math.abs(elevation[nextIdx] - zCurr);
+        const dirSlope = Math.atan2(dz, stepDist) * (180 / Math.PI);
+        if (dirSlope > 14.5) continue;
+
+        const nextG = roverCost[curr] + stepDist * (1.0 + dirSlope * 0.08);
+        if (nextG < roverCost[nextIdx]) {
+          roverCost[nextIdx] = nextG;
+          roverParent[nextIdx] = curr;
+          this.fScore[nextIdx] = nextG;
+          this.pushHeap(nextIdx);
+        }
+      }
+    }
+
+    let bestRIdx = startIdx;
+    let bestHeuristic = Infinity;
+    for (let r = 2; r < gridSize - 2; r += 2) {
+      for (let c = 2; c < gridSize - 2; c += 2) {
+        const idx = r * gridSize + c;
+        if (!Number.isFinite(roverCost[idx])) continue;
+        const remDist = Math.hypot(goalCol - c, goalRow - r) * cellStep;
+        const score = remDist + roverCost[idx] * 0.18;
+        if (score < bestHeuristic) {
+          bestHeuristic = score;
+          bestRIdx = idx;
+        }
+      }
+    }
+
+    const rRow = Math.floor(bestRIdx / gridSize);
+    const rCol = bestRIdx % gridSize;
+
+    const roverRev: number[] = [];
+    let trace = bestRIdx;
+    while (trace !== -1) {
+      roverRev.push(trace);
+      trace = roverParent[trace];
+    }
+    roverRev.reverse();
+
+    const footLeg = this.runSearch(
+      sector,
+      rCol,
+      rRow,
+      goalCol,
+      goalRow,
+      2.2,
+      startSolHour,
+      false
+    );
+    if (!footLeg.found) return footLeg;
+
+    const combined = new Int32Array(roverRev.length + footLeg.pathIndices.length - 1);
+    for (let i = 0; i < roverRev.length; i++) combined[i] = roverRev[i];
+    for (let i = 1; i < footLeg.pathIndices.length; i++) {
+      combined[roverRev.length + i - 1] = footLeg.pathIndices[i];
+    }
+
+    const roverDistM = roverCost[bestRIdx] * 0.65;
+    const roverDriveMin = Math.round(roverDistM / 110.0);
+    const roverSedentaryO2 = roverDriveMin * 0.35;
+
+    const computeTimeMs = Math.round((performance.now() - t0) * 100) / 100;
+    return {
+      ...footLeg,
+      pathIndices: combined,
+      roverPathIndices: new Int32Array(roverRev),
+      rendezvousCoord: [rCol, rRow],
+      distanceMeters: Math.round((roverDistM + footLeg.distanceMeters) * 10) / 10,
+      durationMinutes: roverDriveMin + footLeg.durationMinutes,
+      payloadMassKg,
+      estimatedO2Liters: Math.round((roverSedentaryO2 + footLeg.estimatedO2Liters) * 100) / 100,
+      computeTimeMs,
+    };
   }
 
   public findNearestSafeHaven(
@@ -753,10 +891,6 @@ export class AnisotropicPathfinder {
       const dz = elevation[idx] - elevation[i0];
       const sDeg = Math.abs(Math.atan2(dz, d) * (180 / Math.PI));
 
-      // GPS-Denied Navigation CEP update:
-      // 1) Active UHF link -> 2-Way Radiometric Ranging lock (±0.8m)
-      // 2) Occluded UHF -> Check Optical Skyline Triangulation to >=2 Prominence Landmarks (±2.4m)
-      // 3) Canyon Blind Spot -> Foot-Mounted IMU Dead Reckoning drift (+2.8% of distance walked)
       if (hasUhf) {
         currentCep = 0.8;
       } else {
@@ -805,7 +939,8 @@ export class AnisotropicPathfinder {
       pathIndices,
       pathCepMeters,
       maxCepMeters: Math.round(maxCepMeters * 10) / 10,
-      minIceDepthMeters: Math.round((Number.isFinite(minIceDepthMeters) ? minIceDepthMeters : 12.0) * 10) / 10,
+      minIceDepthMeters:
+        Math.round((Number.isFinite(minIceDepthMeters) ? minIceDepthMeters : 12.0) * 10) / 10,
       distanceMeters: Math.round(distanceMeters * 10) / 10,
       durationMinutes,
       arrivalSolHour,

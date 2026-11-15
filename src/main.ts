@@ -271,15 +271,25 @@ function updateRouteAndHud(col: number, row: number): void {
   const slope = sector.slopeDeg[idx].toFixed(1);
   const unit = GEOLOGIC_UNIT_LABELS[sector.geologicUnit[idx]];
 
-  const route = pathfinder.findRoute(
-    sector,
-    sector.site.habCol,
-    sector.site.habRow,
-    col,
-    row,
-    payloadKg,
-    hr
-  );
+  const route = wristHud.isRoverAssistEnabled()
+    ? pathfinder.findRoverAssistedRoute(
+        sector,
+        sector.site.habCol,
+        sector.site.habRow,
+        col,
+        row,
+        payloadKg,
+        hr
+      )
+    : pathfinder.findRoute(
+        sector,
+        sector.site.habCol,
+        sector.site.habRow,
+        col,
+        row,
+        payloadKg,
+        hr
+      );
   const naive = pathfinder.evaluateDirectPath(
     sector,
     sector.site.habCol,
@@ -294,7 +304,7 @@ function updateRouteAndHud(col: number, row: number): void {
   wristHud.setElevationProgress(viewer.getRouteProgress());
 
   if (route.found) {
-    viewer.renderRoute(route.pathIndices, false, naive.pathIndices, route.pathCepMeters);
+    viewer.renderRoute(route.pathIndices, false, naive.pathIndices, route.pathCepMeters, route.roverPathIndices);
     if (hotspot.found) viewer.renderDiscoveryHotspot(hotspot.col, hotspot.row);
     telemetry.textContent = `[Dep Sol ${hr.toFixed(1)} → Arr ${route.arrivalSolHour.toFixed(1)}] Target (${col},${row}) [${unit}] Elev:${elev}m Slope:${slope}° | Max CEP: ±${route.maxCepMeters}m | Ice: -${route.minIceDepthMeters}m`;
   } else {

@@ -64,6 +64,8 @@ export class Scene3DHarness {
   private waypointGroup = new THREE.Group();
   private labelGroup = new THREE.Group();
   private routeMesh: THREE.Mesh | null = null;
+  private roverRouteMesh: THREE.Mesh | null = null;
+  private roverDropGroup = new THREE.Group();
   private naiveRouteMesh: THREE.Mesh | null = null;
   private activeCurve: THREE.CatmullRomCurve3 | null = null;
   private activePathIndices: Int32Array = new Int32Array(0);
@@ -174,6 +176,7 @@ export class Scene3DHarness {
       this.landmarkGroup,
       this.hazardGroup,
       this.cepRingGroup,
+      this.roverDropGroup,
       this.targetMesh,
       this.astronautMesh,
       this.waypointGroup,
@@ -524,6 +527,8 @@ export class Scene3DHarness {
     }
     posAttr.needsUpdate = true;
     this.geometry.computeVertexNormals();
+    this.geometry.computeBoundingBox();
+    this.geometry.computeBoundingSphere();
     this.habMesh.position.copy(this.gridToWorld(site.habCol, site.habRow, 1.6));
     this.habLabel.position.copy(this.gridToWorld(site.habCol, site.habRow, 4.4));
 
@@ -558,11 +563,40 @@ export class Scene3DHarness {
     pathIndices: Int32Array,
     isSafeHaven = false,
     naiveIndices?: Int32Array,
-    pathCepMeters?: Float32Array
+    pathCepMeters?: Float32Array,
+    roverIndices?: Int32Array
   ): void {
     this.clearRoute();
     const { gridSize } = this.sector;
     this.activeIsSafeHaven = isSafeHaven;
+
+    if (roverIndices && roverIndices.length >= 2) {
+      const rPts: THREE.Vector3[] = [];
+      for (let i = 0; i < roverIndices.length; i++) {
+        const idx = roverIndices[i];
+        rPts.push(this.gridToWorld(idx % gridSize, Math.floor(idx / gridSize), 0.62));
+      }
+      const rCurve = new THREE.CatmullRomCurve3(rPts);
+      const rGeo = new THREE.TubeGeometry(rCurve, Math.min(rPts.length * 2, 140), 0.36, 6, false);
+      const rMat = new THREE.MeshBasicMaterial({ color: 0xffcc00 });
+      this.roverRouteMesh = new THREE.Mesh(rGeo, rMat);
+      this.scene.add(this.roverRouteMesh);
+
+      const dropIdx = roverIndices[roverIndices.length - 1];
+      const dropR = Math.floor(dropIdx / gridSize);
+      const dropC = dropIdx % gridSize;
+      const roverBox = new THREE.Mesh(
+        new THREE.BoxGeometry(1.8, 1.1, 2.2),
+        new THREE.MeshBasicMaterial({ color: 0xffcc00 })
+      );
+      roverBox.position.copy(this.gridToWorld(dropC, dropR, 1.1));
+      this.roverDropGroup.add(roverBox);
+
+      const badge = this.createBadgeSprite("🛞 ROVER BASECAMP", "#ffcc00");
+      badge.scale.set(7.5, 1.9, 1);
+      badge.position.copy(this.gridToWorld(dropC, dropR, 3.6));
+      this.roverDropGroup.add(badge);
+    }
 
     if (naiveIndices && naiveIndices.length >= 2) {
       const nPts: THREE.Vector3[] = [];
@@ -628,6 +662,12 @@ export class Scene3DHarness {
       this.scene.remove(this.routeMesh);
       this.routeMesh = null;
     }
+    if (this.roverRouteMesh) {
+      this.roverRouteMesh.geometry.dispose();
+      this.scene.remove(this.roverRouteMesh);
+      this.roverRouteMesh = null;
+    }
+    this.roverDropGroup.clear();
     if (this.activePathIndices.length < 2) return;
 
     const { gridSize } = this.sector;

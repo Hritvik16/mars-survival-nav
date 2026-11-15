@@ -62,6 +62,11 @@ export class WristHudPanel {
     EVA_INSTRUMENTS.filter((i) => i.defaultSelected).map((i) => i.id)
   );
   private openDrawers = new Set<string>(['pov']);
+  private roverAssistEnabled = false;
+
+  public isRoverAssistEnabled(): boolean {
+    return this.roverAssistEnabled;
+  }
   private svgCoords: { x: number; y: number }[] = [];
 
   private onSelectWaypoint?: (col: number, row: number) => void;
@@ -255,8 +260,8 @@ export class WristHudPanel {
     );
 
     const cellWalkbackO2 = sector.walkbackO2[idx];
-    const displayO2 = smart.isMultiWaypointLoop
-      ? smart.estimatedO2Liters
+    const displayO2 = smart.isMultiWaypointLoop || smart.rendezvousCoord
+      ? smart.estimatedO2Liters * (smart.rendezvousCoord ? 2.0 : 1.0)
       : Number.isFinite(cellWalkbackO2)
         ? cellWalkbackO2
         : smart.estimatedO2Liters * 2;
@@ -504,7 +509,16 @@ export class WristHudPanel {
   }
 
   private renderLoadoutSelector(recommendedIds: readonly string[] = []): string {
-    return EVA_INSTRUMENTS.map((inst) => {
+    const roverToggle = `
+      <label style="display:flex;align-items:flex-start;gap:6px;margin-bottom:6px;cursor:pointer;padding:4px 5px;background:#2b2108;border:1px solid #ffcc00;">
+        <input type="checkbox" id="cb-rover-assist" ${this.roverAssistEnabled ? "checked" : ""} style="margin-top:2px;cursor:pointer;" />
+        <span style="font-size:10px;line-height:1.25;color:#ffdfc2;">
+          <b style="color:#ffcc00;">🛞 Companion Utility Rover Haul</b><br/>
+          <span style="color:#d6c2b2;">Rover hauls pack on slopes ≤14.5° to Rendezvous Basecamp; astronaut scrambles final cliff with 2.2kg hand kit.</span>
+        </span>
+      </label>
+    `;
+    return roverToggle + EVA_INSTRUMENTS.map((inst) => {
       const checked = this.selectedInstrumentIds.has(inst.id) ? 'checked' : '';
       const isRec = recommendedIds.includes(inst.id);
       return `
@@ -546,6 +560,13 @@ export class WristHudPanel {
       loopBtn.onclick = () => this.onRunScienceLoop?.();
     }
 
+    const roverCb = this.panel.querySelector<HTMLInputElement>("#cb-rover-assist");
+    if (roverCb) {
+      roverCb.onchange = () => {
+        this.roverAssistEnabled = roverCb.checked;
+        this.onLoadoutChange?.(this.getPayloadMassKg());
+      };
+    }
     const checkboxes = this.panel.querySelectorAll<HTMLInputElement>('input[data-inst-id]');
     checkboxes.forEach((cb) => {
       cb.onchange = () => {

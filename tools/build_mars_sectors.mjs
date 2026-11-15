@@ -115,16 +115,14 @@ function evaluateSiteCell(site, u, v) {
   let tiu = 280;
   let unit = 1;
 
-  if (siteId === 'mount_sharp' || siteId === 'deuteronilus') {
-    const canyonFreq = siteId === 'mount_sharp' ? 1.35 : 1.0;
-    const stepHeight = siteId === 'mount_sharp' ? 3.2 : 4.0;
+  if (siteId === 'mount_sharp') {
+    // 1. MOUNT SHARP: S-Curve Gediz Vallis Canyon + Stepped Sulfate Benches + Boxwork Ridge
     const canyonWarp = fbm2D(nx * 0.8, ny * 0.8, 2) * 0.18;
-    const canyonPath = Math.sin(ny * canyonFreq) * 0.62 + canyonWarp;
+    const canyonPath = Math.sin(ny * 1.35) * 0.62 + canyonWarp;
     const canyonDist = Math.abs(nx - canyonPath);
     const canyonFloor = Math.tanh(canyonDist * 1.85) * 10.8 - 5.4;
     const rawMesa = canyonFloor + regionalTilt * 1.2 + naturalDetail * 1.15;
-
-    const steppedStrata = smoothTerraces(rawMesa, stepHeight, 2.3);
+    const steppedStrata = smoothTerraces(rawMesa, 3.2, 2.3);
 
     const rampNorth = Math.exp(-Math.pow((ny + 0.85) / 0.45, 2));
     const rampSouth = Math.exp(-Math.pow((ny - 0.75) / 0.45, 2));
@@ -144,33 +142,74 @@ function evaluateSiteCell(site, u, v) {
       unit = 2;
     } else {
       tiu = 245 + naturalDetail * 30;
-      unit = siteId === 'deuteronilus' ? 3 : 1;
+      unit = 1;
+    }
+  } else if (siteId === 'deuteronilus') {
+    // 2. DEUTERONILUS MENSAE: Fretted Dichotomy Isolated Flat-Topped Buttes/Mesas + Glacial Troughs
+    const warpX = nx + fbm2D(nx * 1.2, ny * 1.2, 2) * 0.25;
+    const warpY = ny + fbm2D(nx * 1.2 + 4.0, ny * 1.2 + 4.0, 2) * 0.25;
+
+    const butteNE = Math.hypot((warpX - 0.85) * 0.9, (warpY + 0.65) * 1.1);
+    const butteSE = Math.hypot((warpX - 0.35) * 1.0, (warpY - 0.85) * 0.95);
+    const butteNW = Math.hypot((warpX + 0.95) * 1.1, (warpY + 0.85) * 1.1);
+
+    const mesa1 = (1.0 - Math.tanh((butteNE - 0.92) * 3.2)) * 4.2;
+    const mesa2 = (1.0 - Math.tanh((butteSE - 0.78) * 3.0)) * 3.6;
+    const mesa3 = (1.0 - Math.tanh((butteNW - 0.72) * 3.2)) * 3.4;
+
+    // Central glacial valley floor with eolian drift pocket in the deep trough
+    const valleyFloor = -3.8 + Math.sin(nx * 1.1) * 0.6 + naturalDetail * 0.85;
+    strata = valleyFloor + mesa1 + mesa2 + mesa3;
+
+    const troughDist = Math.hypot(nx - 0.05, ny + 0.05);
+    if (troughDist < 0.48) {
+      tiu = 72 + troughDist * 65;
+      unit = 0;
+    } else if (strata > 1.6) {
+      tiu = 345 + naturalDetail * 30;
+      unit = 2;
+    } else {
+      tiu = 275 + naturalDetail * 25;
+      unit = 3; // SHARAD Subsurface Glacial Ice Apron
     }
   } else if (siteId === 'arcadia_ap1') {
-    const crater1 = Math.hypot(nx - 0.7, ny + 0.35);
-    const crater2 = Math.hypot(nx + 0.68, ny + 0.62);
-    const bowl1 = crater1 < 0.72 ? -Math.cos((crater1 / 0.72) * (Math.PI / 2)) * 5.2 : 0;
-    const bowl2 = crater2 < 0.65 ? -Math.cos((crater2 / 0.65) * (Math.PI / 2)) * 4.8 : 0;
-    const rim1 = Math.exp(-Math.pow((crater1 - 0.72) / 0.14, 2)) * 1.1;
-    const rim2 = Math.exp(-Math.pow((crater2 - 0.65) / 0.13, 2)) * 1.0;
-    strata = bowl1 + bowl2 + rim1 + rim2 + regionalTilt * 0.6 + naturalDetail * 0.75;
-    tiu = crater1 < 0.48 || crater2 < 0.46 ? 72 : 315 + naturalDetail * 30;
-    unit = tiu < 110 ? 0 : 3;
+    // 3. ARCADIA PLANITIA: 3 Terraced Impact Craters on Volcanic Plains (clear of Hab & WP-2)
+    const craterNW = Math.hypot(nx + 0.68, ny + 0.62);
+    const craterSW = Math.hypot(nx + 0.78, ny - 0.82);
+    const craterSE = Math.hypot(nx - 0.65, ny - 0.78);
+
+    const bowlNW = craterNW < 0.56 ? -Math.cos((craterNW / 0.56) * (Math.PI / 2)) * 3.8 : 0;
+    const bowlSW = craterSW < 0.58 ? -Math.cos((craterSW / 0.58) * (Math.PI / 2)) * 4.1 : 0;
+    const bowlSE = craterSE < 0.62 ? -Math.cos((craterSE / 0.62) * (Math.PI / 2)) * 4.4 : 0;
+
+    const rimNW = Math.exp(-Math.pow((craterNW - 0.56) / 0.14, 2)) * 1.15;
+    const rimSW = Math.exp(-Math.pow((craterSW - 0.58) / 0.14, 2)) * 1.25;
+    const rimSE = Math.exp(-Math.pow((craterSE - 0.62) / 0.15, 2)) * 1.35;
+
+    strata = bowlNW + bowlSW + bowlSE + rimNW + rimSW + rimSE + regionalTilt * 0.45 + naturalDetail * 0.55;
+    tiu = craterNW < 0.42 || craterSW < 0.42 || craterSE < 0.44 ? 70 : 315 + naturalDetail * 30;
+    unit = tiu < 110 ? 0 : rimNW > 0.6 || rimSE > 0.6 ? 2 : 3;
   } else {
-    // Phlegra Montes Lobate Debris Apron with steep main scarp + 2 traversable glacial outwash valleys
-    const valleyNorth = Math.exp(-Math.pow((ny + 0.65) / 0.48, 2));
-    const valleySouth = Math.exp(-Math.pow((ny - 0.55) / 0.48, 2));
+    // 4. PHLEGRA MONTES: Diagonal Tectonic Mountain Scarp + Braided Glacial Outwash Valleys
+    const diagCoord = nx * 0.82 - ny * 0.57;
+    const crossCoord = nx * 0.57 + ny * 0.82;
+
+    const valleyNorth = Math.exp(-Math.pow((crossCoord + 0.62) / 0.46, 2));
+    const valleySouth = Math.exp(-Math.pow((crossCoord - 0.52) / 0.46, 2));
     const valleyBlend = Math.min(1.0, valleyNorth + valleySouth);
 
-    const steepScarp = Math.tanh((nx + 0.25) * 1.85) * 9.2;
-    const gentleOutwash = Math.tanh((nx + 0.25) * 0.75) * 6.2;
+    const steepScarp = Math.tanh((diagCoord + 0.2) * 1.95) * 9.6;
+    const gentleOutwash = Math.tanh((diagCoord + 0.2) * 0.75) * 6.0;
     const apronSlope = steepScarp * (1.0 - valleyBlend * 0.75) + gentleOutwash * (valleyBlend * 0.75);
 
     const moraineRidges =
-      nx > -0.25 ? fbm2D(nx * 3.2, ny * 2.2, 3) * 1.1 * (1.0 - valleyBlend * 0.5) : 0;
-    strata = apronSlope + moraineRidges + regionalTilt * 0.6 + naturalDetail * 0.55;
-    tiu = Math.abs(nx + 0.25) < 0.28 && valleyBlend < 0.35 ? 78 : 330 + naturalDetail * 25;
-    unit = nx > -0.1 ? 3 : tiu < 110 ? 0 : 2;
+      diagCoord > -0.2
+        ? Math.sin(diagCoord * 9.0) * 0.65 * (1.0 - valleyBlend * 0.5) +
+          fbm2D(nx * 3.2, ny * 2.2, 3) * 0.9
+        : 0;
+    strata = apronSlope + moraineRidges + regionalTilt * 0.5 + naturalDetail * 0.55;
+    tiu = Math.abs(diagCoord + 0.2) < 0.26 && valleyBlend < 0.35 ? 78 : 330 + naturalDetail * 25;
+    unit = diagCoord > -0.05 ? 3 : tiu < 110 ? 0 : 2;
   }
 
   return { strata: strata * VERTICAL_SCALE, tiu: Math.max(45, tiu), unit };
@@ -219,4 +258,4 @@ for (const site of SITES) {
 
   fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2));
 }
-console.log('Fixed Phlegra Montes glacial outwash valleys & updated binary packs.');
+console.log('Rebuilt all 4 Mars binary packs with distinct site geomorphologies.');

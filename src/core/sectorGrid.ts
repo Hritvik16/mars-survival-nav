@@ -63,7 +63,7 @@ export async function loadSectorFromBinary(
   solHour = 14.0
 ): Promise<SectorBuffers> {
   const baseUrl = `/data/${siteId}`;
-  const manifestRes = await fetch(`${baseUrl}/manifest.json`);
+  const manifestRes = await fetch(`${baseUrl}/manifest.json`, { cache: "no-store" });
   if (!manifestRes.ok) {
     throw new Error(`Failed to load manifest for ${siteId}`);
   }
@@ -74,9 +74,9 @@ export async function loadSectorFromBinary(
   const geoDesc = manifest.channels.find((c) => c.id === 'geologic_unit')!;
 
   const [elevBuf, tiuBuf, geoBuf] = await Promise.all([
-    fetch(`${baseUrl}/${elevDesc.file}`).then((r) => r.arrayBuffer()),
-    fetch(`${baseUrl}/${tiuDesc.file}`).then((r) => r.arrayBuffer()),
-    fetch(`${baseUrl}/${geoDesc.file}`).then((r) => r.arrayBuffer()),
+    fetch(`${baseUrl}/${elevDesc.file}`, { cache: "no-store" }).then((r) => r.arrayBuffer()),
+    fetch(`${baseUrl}/${tiuDesc.file}`, { cache: "no-store" }).then((r) => r.arrayBuffer()),
+    fetch(`${baseUrl}/${geoDesc.file}`, { cache: "no-store" }).then((r) => r.arrayBuffer()),
   ]);
 
   const gridSize = elevDesc.width;
