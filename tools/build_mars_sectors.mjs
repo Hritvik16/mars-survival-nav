@@ -1,6 +1,10 @@
 // tools/build_mars_sectors.mjs
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// Trek tiles are resolved relative to this script (tools/..), never the caller's working directory.
+const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const SECTOR_SIZE_METERS = 2048;
 const VERTICAL_SCALE = 15.5;
@@ -92,16 +96,25 @@ function smoothTerraces(val, stepHeight, sharpness = 2.4) {
   return (base + smoothFrac) * stepHeight;
 }
 
-function computeRegionalTileBias(trekFile, u, v) {
-  try {
-    const buf = fs.readFileSync(trekFile);
-    if (buf.length < 2048) return 0;
-    const offset = 1024 + Math.floor((u * 0.45 + v * 0.45) * (buf.length - 1500));
-    const b0 = buf[offset] / 255.0 - 0.5;
-    return (u - 0.5) * 1.15 + (0.5 - v) * 0.75 + b0 * 0.05;
-  } catch {
-    return (u - 0.5) * 1.15;
+const trekCache = new Map();
+function readTrekTile(trekFile) {
+  let buf = trekCache.get(trekFile);
+  if (!buf) {
+    const abs = path.resolve(PROJECT_ROOT, trekFile);
+    // Fail loudly: a missing / truncated tile must never silently change the generated terrain.
+    if (!fs.existsSync(abs)) throw new Error(`Trek tile not found: ${abs}`);
+    buf = fs.readFileSync(abs);
+    if (buf.length < 2048) throw new Error(`Trek tile too small (${buf.length} bytes): ${abs}`);
+    trekCache.set(trekFile, buf);
   }
+  return buf;
+}
+
+function computeRegionalTileBias(trekFile, u, v) {
+  const buf = readTrekTile(trekFile);
+  const offset = 1024 + Math.floor((u * 0.45 + v * 0.45) * (buf.length - 1500));
+  const b0 = buf[offset] / 255.0 - 0.5;
+  return (u - 0.5) * 1.15 + (0.5 - v) * 0.75 + b0 * 0.05;
 }
 
 function evaluateSiteCell(site, u, v) {

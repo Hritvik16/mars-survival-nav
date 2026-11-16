@@ -1,3 +1,24 @@
+/**
+ * @file main.ts
+ * @module main
+ *
+ * Application entry point: wires the core solvers (src/core) to the 3D viewer and the HUD.
+ *
+ * State: `sector` (active SectorBuffers), one shared AnisotropicPathfinder, the last clicked cell,
+ * `activeLoopMode` (true while the full science loop is the displayed route) and the last walkback
+ * reachable %. The Sol slider (6..18 h, step 0.2) re-runs recomputeSolarShadow, the walkback
+ * envelope and then the active route, which is how the "4D" departure-time dependence is exercised.
+ *
+ * Dataflow per interaction:
+ *   Click      -> viewer.onTerrainClick -> updateRouteAndHud (findRoute | findRoverAssistedRoute
+ *                 + evaluateDirectPath + findRouteDiscoveryHotspot) -> viewer.renderRoute + HUD
+ *   Shift+Click-> pathfinder.toggleInSituHazard -> walkback envelope -> re-solve the active route
+ *   RELAY      -> deployOptimalCommsRelay -> comms heat map -> re-solve
+ *   SHELTER    -> findNearestSafeHaven(SVF <= 0.58) from the last clicked cell
+ *   3D STRATA  -> viewer.toggleStrataCurtain (runs the full loop first if no route exists)
+ *   WALKBACK / DISCOVERY layer buttons -> viewer.applyHeatmap
+ *   VISOR POV  -> viewer.setPovMode (needs a route; routes to waypoint 1 if none)
+ */
 import {
   createSyntheticSector,
   GEOLOGIC_UNIT_LABELS,
@@ -13,6 +34,8 @@ import { WristHudPanel } from './viewer/wristHud';
 
 document.body.style.margin = '0';
 
+// Start with the in-memory synthetic sector so the first frame never waits on the network;
+// activateSite('mount_sharp') (bottom of the file) replaces it with the binary pack.
 let sector = createSyntheticSector(128, 2048, 'mount_sharp');
 const pathfinder = new AnisotropicPathfinder(128 * 128);
 let lastClickedCol = sector.site.habCol;
@@ -67,13 +90,33 @@ siteSelect.style.cssText =
   siteSelect.appendChild(opt);
 });
 
+/**
+ * Loads a site pack (falls back to createSyntheticSector on any fetch / parse / size error and says so
+ * in the status line), resets the route state, recomputes the walkback envelope for the current
+ * payload, and refreshes the viewer and HUD. A load-sequence token makes a slower earlier load discard
+ * its result when a later activateSite() call has started; the Sol slider is read after the await so
+ * the shadow mask matches the slider even if it moved during the load.
+ */
+let loadSeq = 0;
 async function activateSite(siteId: SiteId): Promise<void> {
-  const hr = parseFloat(solSlider.value || '14');
+  const my = ++loadSeq;
+  let loadError: string | null = null;
+  let loaded: typeof sector;
+  const hrAtRequest = parseFloat(solSlider.value || '14');
   try {
-    sector = await loadSectorFromBinary(siteId, hr);
-  } catch {
-    sector = createSyntheticSector(128, 2048, siteId);
+    loaded = await loadSectorFromBinary(siteId, hrAtRequest);
+  } catch (err) {
+    loadError = err instanceof Error ? err.message : String(err);
+    loaded = createSyntheticSector(128, 2048, siteId);
   }
+  if (my !== loadSeq) return; // a later site switch superseded this load
+  sector = loaded;
+  const hr = parseFloat(solSlider.value || '14');
+  if (hr !== hrAtRequest) {
+    recomputeSolarShadow(sector.elevation, sector.solarShadow, sector.gridSize, sector.worldSizeMeters, hr);
+  }
+  // Reset per-site UI state that would otherwise show stale values.
+  walkSlider.value = '0';
   activeLoopMode = false;
   lastClickedCol = sector.site.habCol;
   lastClickedRow = sector.site.habRow;
@@ -81,8 +124,11 @@ async function activateSite(siteId: SiteId): Promise<void> {
   lastReachablePct = env.reachablePercent;
   viewer.setSector(sector);
   syncPovButtonLabel();
+  strataBtn.style.background = viewer.isStrataCurtainVisible() ? '#004455' : '#1a1429';
   wristHud.updateIdle(sector, lastReachablePct);
-  telemetry.textContent = `Loaded /data/${siteId}/manifest.json (${sector.memoryKB}KB) | Click = Route | Shift+Click = Drop In-Situ Hazard Block`;
+  telemetry.textContent = loadError
+    ? `⚠️ Could not load /data/${siteId} (${loadError}) — showing SYNTHETIC sector instead | Click = Route | Shift+Click = Drop In-Situ Hazard Block`
+    : `Loaded /data/${siteId}/manifest.json (${sector.memoryKB}KB) | Click = Route | Shift+Click = Drop In-Situ Hazard Block`;
 }
 
 siteSelect.onchange = () => {
@@ -244,6 +290,11 @@ solSlider.step = '0.2';
 solSlider.value = '14';
 solSlider.style.width = '52px';
 
+/**
+ * Plans the optimal HAB -> waypoints -> HAB loop (AnisotropicPathfinder.findScienceLoop) at the
+ * current payload and Sol hour, finds a discovery hotspot along it, updates the HUD and renders it.
+ * Shows "Loop blocked" if no permutation is feasible.
+ */
 function runFullScienceLoop(): void {
   activeLoopMode = true;
   const hr = parseFloat(solSlider.value || '14');
@@ -263,6 +314,12 @@ function runFullScienceLoop(): void {
   }
 }
 
+/**
+ * Plans Hab -> (col,row): the optimised route (rover-assisted multimodal solver when the rover
+ * toggle is on, else A*), plus the naive straight line for comparison and a discovery hotspot, then
+ * pushes everything to the HUD and the 3D view. If the target is impassable the naive line is
+ * drawn alone and a warning is shown.
+ */
 function updateRouteAndHud(col: number, row: number): void {
   const hr = parseFloat(solSlider.value || '14');
   const payloadKg = wristHud.getPayloadMassKg();
@@ -309,10 +366,14 @@ function updateRouteAndHud(col: number, row: number): void {
     telemetry.textContent = `[Dep Sol ${hr.toFixed(1)} → Arr ${route.arrivalSolHour.toFixed(1)}] Target (${col},${row}) [${unit}] Elev:${elev}m Slope:${slope}° | Max CEP: ±${route.maxCepMeters}m | Ice: -${route.minIceDepthMeters}m`;
   } else {
     viewer.renderRoute(new Int32Array(0), false, naive.pathIndices);
-    telemetry.textContent = `⚠️ Target (${col},${row}) IMPASSABLE with ${payloadKg}kg loadout or In-Situ Hazard Block`;
+    telemetry.textContent = route.waypointOrderLabel.startsWith('ROVER UNAVAILABLE')
+      ? `⚠️ Target (${col},${row}): ${route.waypointOrderLabel} — switch the rover toggle off for a foot route`
+      : `⚠️ Target (${col},${row}) IMPASSABLE with ${payloadKg}kg loadout or In-Situ Hazard Block`;
   }
 }
 
+// Sol slider: move the sun light, recompute the shadow mask for the new hour, recompute the walkback
+// envelope (shadow overhead depends on the mask), repaint the heat map and re-solve the active route.
 solSlider.oninput = () => {
   const hr = parseFloat(solSlider.value);
   solLabel.firstChild!.textContent = `Sol:${hr.toFixed(1)} `;
@@ -346,9 +407,10 @@ telemetry.style.cssText =
 telemetry.textContent = `${sector.site.name} | Click = Plot 4D Route | Shift+Click = Drop/Clear In-Situ Hazard Block`;
 document.body.appendChild(telemetry);
 
+// Terrain click: Shift = toggle an in-situ hazard block and live re-route; plain click = plot a route.
 viewer.onTerrainClick((col, row, shiftKey) => {
   if (shiftKey) {
-    const added = pathfinder.toggleInSituHazard(sector, col, row);
+    const result = pathfinder.toggleInSituHazard(sector, col, row);
     viewer.syncInSituHazards();
     const env = pathfinder.computeWalkbackEnvelope(sector, wristHud.getPayloadMassKg());
     lastReachablePct = env.reachablePercent;
@@ -360,9 +422,12 @@ viewer.onTerrainClick((col, row, shiftKey) => {
     } else if (lastClickedCol !== sector.site.habCol || lastClickedRow !== sector.site.habRow) {
       updateRouteAndHud(lastClickedCol, lastClickedRow);
     }
-    telemetry.textContent = added
-      ? `⚠️ IN-SITU SUB-PIXEL HAZARD BLOCKED at (${col},${row}) — Dynamically re-solved 4D EVA route around obstacle!`
-      : `✅ Cleared In-Situ Hazard at (${col},${row}) — Re-computed optimal route`;
+    telemetry.textContent =
+      result === 'added'
+        ? `⚠️ IN-SITU SUB-PIXEL HAZARD BLOCKED at (${col},${row}) — Dynamically re-solved 4D EVA route around obstacle!`
+        : result === 'cleared'
+          ? `✅ Cleared In-Situ Hazard at (${col},${row}) — Re-computed optimal route`
+          : `ℹ️ Hazard click at (${col},${row}) ignored — too close to the Hab or off the interior grid; nothing changed`;
     return;
   }
 

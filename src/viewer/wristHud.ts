@@ -1,4 +1,13 @@
 // src/viewer/wristHud.ts
+/**
+ * @file wristHud.ts
+ * @module viewer/wristHud
+ *
+ * DOM/HTML "wrist co-processor" panel and the helmet-visor overlay. It formats RouteResult numbers,
+ * draws the three PLSS gauges, the elevation / ice profile SVG, the loadout selector, the NASA
+ * imagery cards and the citation links. It performs NO route physics; the only arithmetic here is
+ * presentation scaling documented per method.
+ */
 import { GEOLOGIC_UNIT_LABELS, type SectorBuffers } from '../core/sectorData';
 import {
   EVA_INSTRUMENTS,
@@ -11,6 +20,10 @@ import {
 } from '../core/pathfinder';
 import type { VisorTelemetrySample } from './scene3D';
 
+/**
+ * Per-geologic-class boot-surface card. Index in UNIT_SURFACE_POV = geologic class id 0..3.
+ * piaId is the catalogue id SHOWN in the HUD text; imgUrl is the file actually loaded.
+ */
 interface SurfacePovInfo {
   readonly piaId: string;
   readonly missionCam: string;
@@ -19,6 +32,12 @@ interface SurfacePovInfo {
   readonly recommendedInstrumentIds: readonly string[];
 }
 
+/**
+ * Class 0 -> PIA20168 (Curiosity, Bagnold Dunes), 1 -> PIA19912 (Curiosity, sulfate strata),
+ * 2 -> displayed id "PIA19307" but file /images/PIA19077.jpg, 3 -> displayed id "PIA10907" but file
+ * /images/PIA10940.jpg (Phoenix workplace map per the JPEG metadata). The two labelled ids do not
+ * match the shipped file names; the hazard notes and instrument recommendations are authored text.
+ */
 const UNIT_SURFACE_POV: readonly SurfacePovInfo[] = [
   {
     piaId: 'PIA20168',
@@ -54,6 +73,11 @@ const UNIT_SURFACE_POV: readonly SurfacePovInfo[] = [
   },
 ];
 
+/**
+ * The right-hand HUD panel plus visor overlay and the full-screen image lightbox.
+ * Callbacks: onSelectWaypoint(col,row) route to a waypoint / hotspot; onLoadoutChange(payloadKg)
+ * called when an instrument or the rover-assist box is toggled; onRunScienceLoop() runs the full loop.
+ */
 export class WristHudPanel {
   private readonly panel: HTMLDivElement;
   private readonly visorOverlay: HTMLDivElement;
@@ -126,6 +150,9 @@ export class WristHudPanel {
     }
   }
 
+  /**
+   * Sum of the selected instruments' massKg, rounded to 0.1 kg (default selection = 15.5 kg).
+   */
   public getPayloadMassKg(): number {
     let sum = 0;
     for (const inst of EVA_INSTRUMENTS) {
@@ -134,6 +161,10 @@ export class WristHudPanel {
     return Math.round(sum * 10) / 10;
   }
 
+  /**
+   * Moves the cursor line and dot on the elevation SVG to path fraction progress01 (0..1) using the
+   * precomputed svgCoords (one point per route node).
+   */
   public setElevationProgress(progress01: number): void {
     if (this.svgCoords.length === 0) return;
     const dot = this.panel.querySelector<SVGCircleElement>('#svg-elev-dot');
@@ -151,6 +182,12 @@ export class WristHudPanel {
     line.setAttribute('x2', pt.x.toFixed(1));
   }
 
+  /**
+   * Renders the first-person visor HUD from one VisorTelemetrySample (null hides it): heading, nav
+   * mode + CEP, progress and SHARAD ice depth, boot pitch and absolute elevation (slope > 20 deg shows
+   * amber), the unit boot-surface photo, sunlit / shadow, UHF-locked / optical-nav, and
+   * RAD SHIELD = 100 - skyViewPct %.
+   */
   public updateVisorOverlay(sample: VisorTelemetrySample | null): void {
     if (!sample) {
       this.visorOverlay.style.display = 'none';
@@ -214,9 +251,13 @@ export class WristHudPanel {
     `;
   }
 
+  /**
+   * Idle (no route) panel: walkback-reachable %, pack mass and the displayed slope limit
+   * max(22, 32 - 0.15 m) deg (the same floor the pathfinder uses), waypoint buttons, loadout and citations.
+   */
   public updateIdle(sector: SectorBuffers, reachablePct = 78): void {
     const massKg = this.getPayloadMassKg();
-    const maxSlope = (32.0 - 0.15 * massKg).toFixed(1);
+    const maxSlope = Math.max(22.0, 32.0 - 0.15 * massKg).toFixed(1);
     this.svgCoords = [];
     this.panel.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:center;color:#00f0ff;font-weight:bold;font-size:12px;border-bottom:1px solid #ff9d5c44;padding-bottom:5px;margin-bottom:8px;">
@@ -242,6 +283,18 @@ export class WristHudPanel {
     this.bindInteractiveControls(sector);
   }
 
+  /**
+   * Main route HUD. Presentation formulas (all from RouteResult):
+   *   O2 shown = loop or rover route: estimatedO2 (x2.0 for the rover case, a round trip);
+   *              single target: the cell's walkbackO2 round-trip value if finite, else 2 x estimatedO2;
+   *   O2 ceiling = 180 L (PLSS) for loops, 95 L (single-sortie walkback limit) otherwise;
+   *   o2Pct = min(100, round(100 * shown / ceiling));  red > 95 %, amber > 75 %, else green;
+   *   SWME water and battery are doubled for non-loop routes (out and back), loops are already closed;
+   *   waterPct = 100 * water / 4.2 L,  battPct = 100 * Wh / 850 Wh;
+   *   status: BLOCKED (not found) | SHELTER OK | SAFE RETURN (shown <= ceiling) | WALKBACK EXCEEDED;
+   *   naiveFatal = naive.maxSlope > smart.safeSlopeLimit OR naive sand > 160 m.
+   * @param smart  optimised route;  @param naive  straight-line baseline;  @param hotspot optional contact
+   */
   public updateRouteComparison(
     sector: SectorBuffers,
     col: number,
@@ -395,6 +448,9 @@ export class WristHudPanel {
     this.bindInteractiveControls(sector);
   }
 
+  /**
+   * Collapsible <details> section; open state is remembered in openDrawers across re-renders.
+   */
   private renderDrawer(id: string, summaryText: string, bodyHtml: string): string {
     const isOpen = this.openDrawers.has(id) ? 'open' : '';
     return `
@@ -409,6 +465,9 @@ export class WristHudPanel {
     `;
   }
 
+  /**
+   * FULL LOOP button + one pill per waypoint.
+   */
   private renderCompactWaypoints(sector: SectorBuffers): string {
     const pills = sector.site.waypoints
       .map(
@@ -432,6 +491,9 @@ export class WristHudPanel {
     `;
   }
 
+  /**
+   * "Smart 4D A* vs Naive Direct" table: verdict, distance, max slope, sand, CEP, SWME water / battery.
+   */
   private renderComparisonTable(
     smart: RouteResult,
     naive: RouteResult,
@@ -482,6 +544,9 @@ export class WristHudPanel {
     `;
   }
 
+  /**
+   * Boot-surface photo (click to enlarge) with mission camera name and hazard note.
+   */
   private renderSurfacePovCard(pov: SurfacePovInfo, scienceGoal?: string): string {
     return `
       <div>
@@ -508,6 +573,10 @@ export class WristHudPanel {
     `;
   }
 
+  /**
+   * Instrument checkboxes (mass in kg, heritage) plus the Companion Utility Rover Haul toggle
+   * (rover carries the pack on slopes <= 14.5 deg to the rendezvous basecamp; see findRoverAssistedRoute).
+   */
   private renderLoadoutSelector(recommendedIds: readonly string[] = []): string {
     const roverToggle = `
       <label style="display:flex;align-items:flex-start;gap:6px;margin-bottom:6px;cursor:pointer;padding:4px 5px;background:#2b2108;border:1px solid #ffcc00;">
@@ -534,6 +603,10 @@ export class WristHudPanel {
     }).join('');
   }
 
+  /**
+   * Wires the freshly rendered DOM: waypoint pills, hotspot detour button, FULL LOOP, rover toggle,
+   * instrument checkboxes (each fires onLoadoutChange), drawer state and the image lightbox.
+   */
   private bindInteractiveControls(sector: SectorBuffers): void {
     const buttons = this.panel.querySelectorAll<HTMLButtonElement>('button[data-wp-idx]');
     buttons.forEach((btn) => {
@@ -598,6 +671,9 @@ export class WristHudPanel {
     });
   }
 
+  /**
+   * Orbital context card with the 256x256 JPL Mars Trek tile of the site (click to enlarge).
+   */
   private renderMarsTrekOrbitalCard(sector: SectorBuffers): string {
     return `
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
@@ -621,6 +697,11 @@ export class WristHudPanel {
     `;
   }
 
+  /**
+   * 315x56 px profile of surface elevation along the route and, dashed, the ice horizon drawn at
+   * z_ice = z - 2.5 * iceTableDepth (a 2.5x vertical exaggeration of the ice depth for legibility).
+   *     y = h - 6 - (z - zmin) / max(4, zmax - zmin) * (h - 16),   zmin = min z_ice, zmax = max z
+   */
   private renderElevationSvg(
     sector: SectorBuffers,
     pathIndices: Int32Array,
@@ -673,6 +754,9 @@ export class WristHudPanel {
     `;
   }
 
+  /**
+   * Footer links: JPL Mars Trek, USGS Astrogeology geologic map hub, NASA Curiosity route page, Mars 2020 raw images.
+   */
   private renderNasaCitations(): string {
     return `
       <div style="font-size:9px;line-height:1.35;color:#bfa690;">

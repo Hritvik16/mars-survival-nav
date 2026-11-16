@@ -1,10 +1,32 @@
 // src/viewer/scene3D.ts
+/**
+ * @file scene3D.ts
+ * @module viewer/scene3D
+ *
+ * three.js view layer: terrain mesh, route tubes, CEP rings, relay / hazard / discovery markers,
+ * the translucent subsurface curtain and the first-person "visor" camera. It only READS the
+ * SectorBuffers produced by src/core and contains no routing physics.
+ *
+ * Scene coordinates: the 2.05 km sector is drawn as a sceneSpan = 100 unit square centred on the
+ * origin, so 1 scene unit = 2048 / 100 = 20.48 m horizontally and the SAME factor is applied to
+ * elevation (vScale = sceneSpan / worldSizeMeters). The relief exaggeration is therefore baked into
+ * the generated heights, not applied in the viewer. Mapping (see gridToWorld):
+ *     x = (col / (N-1) - 0.5) * 100,   z = (row / (N-1) - 0.5) * 100,   y = z_m * vScale + offset
+ * and its inverse in onTerrainClick (col, row = round(frac * (N-1)), clamped to 1..N-2).
+ */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { SINGLE_SORTIE_WALKBACK_LIMIT_O2 } from '../core/pathfinder';
 import type { LayerMode, SectorBuffers } from '../core/sectorData';
 import { hasLineOfSight } from '../core/solarAndComms';
 
+/**
+ * One frame of first-person visor telemetry. progressPct 0..100 along the route; col,row grid cell;
+ * elevMeters = baseDatumMeters + elevation (absolute MOLA-style metres); slopeDeg degrees;
+ * headingDeg 0..359 (0 = -z / "north"); skyViewPct = 100 * SVF; cepMeters nav uncertainty (m);
+ * navModeLabel = UHF RANGING LOCK | SKYLINE TRIANGULATION [n PEAKS] | IMU DEAD RECKONING DRIFT;
+ * iceDepthMeters = heuristic SHARAD ice-table depth (m).
+ */
 export interface VisorTelemetrySample {
   readonly progressPct: number;
   readonly col: number;
@@ -23,6 +45,9 @@ export interface VisorTelemetrySample {
 }
 
 const CARDINALS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'] as const;
+// NASA surface photos blended into the terrain detail texture, indexed by geologic class 0..3
+// (sand, sulfate/clay, bedrock/boxwork, ice). File names are the PIA catalogue ids of the
+// files in public/images (note wristHud.ts labels classes 2 and 3 with different PIA ids).
 const UNIT_IMAGE_URLS = [
   '/images/PIA20168.jpg',
   '/images/PIA19912.jpg',
@@ -30,6 +55,12 @@ const UNIT_IMAGE_URLS = [
   '/images/PIA10940.jpg',
 ] as const;
 
+/**
+ * Owns the WebGL renderer, camera, OrbitControls and every scene object. Two camera modes:
+ * orbital (OrbitControls, maxPolarAngle = 0.46 pi) and visor POV (camera rides a CatmullRom
+ * curve through the route nodes; auto-walk advances progress by 0.045 per second, one traverse
+ * in ~22 s, with exponential smoothing lerp factor 0.14 on position and look-at).
+ */
 export class Scene3DHarness {
   public readonly scene: THREE.Scene;
   public readonly camera: THREE.PerspectiveCamera;
@@ -66,6 +97,7 @@ export class Scene3DHarness {
   private routeMesh: THREE.Mesh | null = null;
   private roverRouteMesh: THREE.Mesh | null = null;
   private roverDropGroup = new THREE.Group();
+  private activeRoverIndices: Int32Array = new Int32Array(0);
   private naiveRouteMesh: THREE.Mesh | null = null;
   private activeCurve: THREE.CatmullRomCurve3 | null = null;
   private activePathIndices: Int32Array = new Int32Array(0);
@@ -209,6 +241,14 @@ export class Scene3DHarness {
     });
   }
 
+  /**
+   * Builds the 1024x1024 greyscale detail / bump texture. For each texel the geologic class of the
+   * covering grid cell chooses one of the four tiled NASA photos (tiled at 0.32 scale), whose
+   * luminance L = 0.299 R + 0.587 G + 0.114 B (Rec. 601) is mapped to
+   *     v = 255 * (base + (L - 0.5) * contrast),   off-route:  base 0.84, contrast 0.32
+   *                                                route corridor (cells within +-2 of the path): 0.74, 0.58
+   * so the planned corridor renders darker and higher-contrast. Runs after all four images load.
+   */
   private rebuildSurfaceDetailTexture(): void {
     if (this.unitImages.some((img) => img === null)) return;
     const ctx = this.detailCanvas.getContext('2d')!;
@@ -278,9 +318,14 @@ export class Scene3DHarness {
     this.detailTexture.needsUpdate = true;
   }
 
-  /** Renders exactly one 3D In-Situ Hazard Cone per connected Shift+Click patch */
+  /**
+   * Rebuilds the red hazard cones and badges from sector.inSituBlocked: scanning the interior in
+   * raster order, each unvisited blocked cell starts a new patch, an 11x11 window (+-5) around it is
+   * marked visited (so one 5x5 block yields one cone), and the cone is placed at the patch centre
+   * (c + 2, r + 2, clamped). Pure visualisation; the blocking itself lives in the pathfinder.
+   */
   public syncInSituHazards(): void {
-    this.hazardGroup.clear();
+    this.disposeGroup(this.hazardGroup);
     const { gridSize, inSituBlocked } = this.sector;
     const visited = new Uint8Array(gridSize * gridSize);
     for (let r = 2; r < gridSize - 2; r++) {
@@ -314,7 +359,11 @@ export class Scene3DHarness {
     }
   }
 
-  /** Toggles translucent 3D Subsurface Stratigraphic & SHARAD Radar Curtain view */
+  /**
+   * Toggles the "3D STRATA" view: makes the terrain material 44 % opaque and shows the curtain mesh
+   * built by rebuildSubsurfaceCurtain(). @param forceState explicit on/off, else toggles.
+   * @returns the new visibility.
+   */
   public toggleStrataCurtain(forceState?: boolean): boolean {
     this.strataCurtainVisible =
       forceState !== undefined ? forceState : !this.strataCurtainVisible;
@@ -334,10 +383,21 @@ export class Scene3DHarness {
   /**
    * Builds a 3D Volumetric Subsurface Stratigraphic Curtain & SHARAD Water-Ice Radargram
    * ribbon directly beneath the active traverse path down to -160m depth.
+    *
+    * Geometry: for each of the n path nodes, 8 vertices are stacked at depths
+    *     depth_k = k / 7 * 155 m,  k = 0..7   (22.14 m spacing, drawn at the same 1:1 scale as the terrain),
+    * forming a (n-1) x 7 quad strip. Vertex colours (first rule that matches wins):
+    *     |depth - 3.2 * iceTableDepth| < 14 m   cyan-white   SHARAD water-ice / hydrated lens
+    *                                            (3.2 = display exaggeration of the ice depth)
+    *     depth < 28 m                           brown        regolith / caprock (hue depends on class 2)
+    *     z_surface - depth > -35 m              ochre        Hesperian layered sulfate
+    *     otherwise                              teal-green   Noachian phyllosilicate clay basement
+    * This is a classification display driven by the heuristic ice-table depth and elevation; it is NOT
+    * a measured radargram.
    */
   private rebuildSubsurfaceCurtain(): void {
     if (this.strataCurtainMesh) {
-      this.strataCurtainMesh.geometry.dispose();
+      this.disposeObject(this.strataCurtainMesh);
       this.scene.remove(this.strataCurtainMesh);
       this.strataCurtainMesh = null;
     }
@@ -420,8 +480,12 @@ export class Scene3DHarness {
     this.scene.add(this.strataCurtainMesh);
   }
 
+  /**
+   * Draws the deployed UHF relay (yellow mast, badge) and a tube from the Hab mast to it.
+   * (relayCol, relayRow) are grid indices from deployOptimalCommsRelay().
+   */
   public renderRelayBeacon(relayCol: number, relayRow: number): void {
-    this.relayGroup.clear();
+    this.disposeGroup(this.relayGroup);
     const { habCol, habRow } = this.sector.site;
     const relayPos = this.gridToWorld(relayCol, relayRow, 1.6);
     const habPos = this.gridToWorld(habCol, habRow, 2.2);
@@ -447,8 +511,12 @@ export class Scene3DHarness {
     this.relayGroup.add(new THREE.Mesh(beamGeo, beamMat));
   }
 
+  /**
+   * Places the green octahedron "UNCONFORMITY" marker at the Shannon-entropy hotspot (hidden in POV
+   * mode or when col/row < 0).
+   */
   public renderDiscoveryHotspot(col: number, row: number): void {
-    this.hotspotGroup.clear();
+    this.disposeGroup(this.hotspotGroup);
     if (col < 0 || row < 0 || this.povMode) return;
     const gem = new THREE.Mesh(
       new THREE.OctahedronGeometry(0.85, 0),
@@ -464,9 +532,38 @@ export class Scene3DHarness {
   }
 
   public clearRelayBeacon(): void {
-    this.relayGroup.clear();
+    this.disposeGroup(this.relayGroup);
   }
 
+  /**
+   * Disposes the geometry, material(s) and material.map of one object (a Mesh / Sprite / Line).
+   * Only call it for per-use resources: every object created by this class's group builders owns its
+   * own geometry, material and CanvasTexture (nothing here is shared or cached).
+   */
+  private disposeObject(obj: THREE.Object3D): void {
+    const o = obj as THREE.Object3D & {
+      geometry?: THREE.BufferGeometry;
+      material?: THREE.Material | THREE.Material[];
+    };
+    o.geometry?.dispose();
+    const mats = Array.isArray(o.material) ? o.material : o.material ? [o.material] : [];
+    for (const m of mats) {
+      (m as THREE.Material & { map?: THREE.Texture | null }).map?.dispose();
+      m.dispose();
+    }
+  }
+
+  /** Traverses a Group, disposes every descendant's geometry / material / material.map, then clears it. */
+  private disposeGroup(g: THREE.Group): void {
+    g.traverse((child) => {
+      if (child !== g) this.disposeObject(child);
+    });
+    g.clear();
+  }
+
+  /**
+   * Creates a 256x64 canvas label sprite (rounded dark plate, coloured border / text), 9.5 x 2.4 scene units.
+   */
   private createBadgeSprite(text: string, borderHex: string): THREE.Sprite {
     const canvas = document.createElement('canvas');
     canvas.width = 256;
@@ -497,6 +594,10 @@ export class Scene3DHarness {
     this.onVisorUpdate = cb;
   }
 
+  /**
+   * Grid cell -> scene position (see file header): x,z = (index/(N-1) - 0.5) * 100, y = elevation[m]
+   * * (100 / worldSizeMeters) + ySceneOffset (scene units).
+   */
   private gridToWorld(col: number, row: number, ySceneOffset = 0): THREE.Vector3 {
     const { gridSize, worldSizeMeters, elevation } = this.sector;
     const vScale = this.sceneSpan / worldSizeMeters;
@@ -506,18 +607,27 @@ export class Scene3DHarness {
     return new THREE.Vector3(x, y, z);
   }
 
+  /**
+   * Swaps in a new sector: leaves POV, clears route / relay / hotspot, re-uploads heights, rebuilds
+   * the detail texture and re-applies the current heat map.
+   */
   public setSector(newSector: SectorBuffers): void {
     this.sector = newSector;
     this.setPovMode(false);
     this.clearRoute();
     this.clearRelayBeacon();
-    this.hotspotGroup.clear();
+    this.disposeGroup(this.hotspotGroup);
     this.syncInSituHazards();
     this.syncElevationBuffer();
     this.rebuildSurfaceDetailTexture();
     this.applyHeatmap(this.currentMode);
   }
 
+  /**
+   * Uploads elevation to the plane geometry (vertex y = elevation * vScale), recomputes normals and
+   * bounds, repositions the Hab, rebuilds the waypoint beacons (magenta octahedra) and draws the
+   * three optical-navigation landmark pins (gold wire cones) used for GPS-denied skyline triangulation.
+   */
   public syncElevationBuffer(): void {
     const posAttr = this.geometry.attributes.position;
     const { elevation, gridSize, worldSizeMeters, site, landmarks } = this.sector;
@@ -532,8 +642,8 @@ export class Scene3DHarness {
     this.habMesh.position.copy(this.gridToWorld(site.habCol, site.habRow, 1.6));
     this.habLabel.position.copy(this.gridToWorld(site.habCol, site.habRow, 4.4));
 
-    this.waypointGroup.clear();
-    this.labelGroup.clear();
+    this.disposeGroup(this.waypointGroup);
+    this.disposeGroup(this.labelGroup);
     for (const wp of site.waypoints) {
       const beacon = new THREE.Mesh(
         new THREE.OctahedronGeometry(1.1, 0),
@@ -548,7 +658,7 @@ export class Scene3DHarness {
     }
 
     // Render Gold Optical Navigation Prominence Peaks for GPS-Denied Skyline Triangulation
-    this.landmarkGroup.clear();
+    this.disposeGroup(this.landmarkGroup);
     for (const lm of landmarks) {
       const pin = new THREE.Mesh(
         new THREE.ConeGeometry(0.55, 1.6, 4),
@@ -559,6 +669,19 @@ export class Scene3DHarness {
     }
   }
 
+  /**
+   * Draws the active route and its companions. Order of operations: clear previous route; optional rover
+   * leg (yellow tube + basecamp box/badge); optional naive straight-line route (translucent red);
+   * then, if the smart path has >= 2 nodes: store indices + per-node CEP, rebuild the detail texture,
+   * the cyan (or green for safe haven) route tube, the subsurface curtain and the CEP rings, and move
+   * the camera. Tubes are CatmullRom curves through the node centres.
+   *
+   * @param pathIndices   smart route, flat indices row*N+col
+   * @param isSafeHaven   colours the route / target green
+   * @param naiveIndices  baseline straight line (red)
+   * @param pathCepMeters per-node CEP in metres
+   * @param roverIndices  Hab -> rendezvous leg (rover-assisted mode)
+   */
   public renderRoute(
     pathIndices: Int32Array,
     isSafeHaven = false,
@@ -570,33 +693,7 @@ export class Scene3DHarness {
     const { gridSize } = this.sector;
     this.activeIsSafeHaven = isSafeHaven;
 
-    if (roverIndices && roverIndices.length >= 2) {
-      const rPts: THREE.Vector3[] = [];
-      for (let i = 0; i < roverIndices.length; i++) {
-        const idx = roverIndices[i];
-        rPts.push(this.gridToWorld(idx % gridSize, Math.floor(idx / gridSize), 0.62));
-      }
-      const rCurve = new THREE.CatmullRomCurve3(rPts);
-      const rGeo = new THREE.TubeGeometry(rCurve, Math.min(rPts.length * 2, 140), 0.36, 6, false);
-      const rMat = new THREE.MeshBasicMaterial({ color: 0xffcc00 });
-      this.roverRouteMesh = new THREE.Mesh(rGeo, rMat);
-      this.scene.add(this.roverRouteMesh);
-
-      const dropIdx = roverIndices[roverIndices.length - 1];
-      const dropR = Math.floor(dropIdx / gridSize);
-      const dropC = dropIdx % gridSize;
-      const roverBox = new THREE.Mesh(
-        new THREE.BoxGeometry(1.8, 1.1, 2.2),
-        new THREE.MeshBasicMaterial({ color: 0xffcc00 })
-      );
-      roverBox.position.copy(this.gridToWorld(dropC, dropR, 1.1));
-      this.roverDropGroup.add(roverBox);
-
-      const badge = this.createBadgeSprite("🛞 ROVER BASECAMP", "#ffcc00");
-      badge.scale.set(7.5, 1.9, 1);
-      badge.position.copy(this.gridToWorld(dropC, dropR, 3.6));
-      this.roverDropGroup.add(badge);
-    }
+    this.activeRoverIndices = roverIndices && roverIndices.length >= 2 ? roverIndices : new Int32Array(0);
 
     if (naiveIndices && naiveIndices.length >= 2) {
       const nPts: THREE.Vector3[] = [];
@@ -627,9 +724,14 @@ export class Scene3DHarness {
     this.updateCameraAlongRoute(true);
   }
 
-  /** Renders GPS-Denied Positional Uncertainty CEP Rings along the route */
+  /**
+   * GPS-denied uncertainty rings: every 12th path node starting at index 8 whose CEP exceeds 1.0 m
+   * (i.e. the UHF lock was lost) gets a flat ring of radius clamp(0.18 * CEP, 0.65, 3.2) scene units
+   * (= 13 m .. 66 m of ground, deliberately exaggerated for legibility, NOT to scale with the CEP in
+   * metres). Gold for CEP <= 5 m, red above 5 m. Hidden in POV mode.
+   */
   private rebuildCepRings(): void {
-    this.cepRingGroup.clear();
+    this.disposeGroup(this.cepRingGroup);
     if (this.povMode || this.activePathIndices.length < 6) return;
     const { gridSize } = this.sector;
 
@@ -656,19 +758,62 @@ export class Scene3DHarness {
     }
   }
 
+  /**
+   * Builds the gold rover-haul tube and the ROVER BASECAMP marker from activeRoverIndices. Called by
+   * rebuildActiveRouteTube() AFTER it disposes the previous rover meshes, so they survive the rebuild
+   * (renderRoute used to build them first and have them disposed immediately).
+   */
+  private buildRoverLeg(): void {
+    const roverIdx = this.activeRoverIndices;
+    if (roverIdx.length < 2) return;
+    const { gridSize } = this.sector;
+    const rPts: THREE.Vector3[] = [];
+    for (let i = 0; i < roverIdx.length; i++) {
+      const idx = roverIdx[i];
+      rPts.push(this.gridToWorld(idx % gridSize, Math.floor(idx / gridSize), 0.62));
+    }
+    const rCurve = new THREE.CatmullRomCurve3(rPts);
+    const rGeo = new THREE.TubeGeometry(rCurve, Math.min(rPts.length * 2, 140), 0.36, 6, false);
+    const rMat = new THREE.MeshBasicMaterial({ color: 0xffcc00 });
+    this.roverRouteMesh = new THREE.Mesh(rGeo, rMat);
+    this.scene.add(this.roverRouteMesh);
+
+    const dropIdx = roverIdx[roverIdx.length - 1];
+    const dropR = Math.floor(dropIdx / gridSize);
+    const dropC = dropIdx % gridSize;
+    const roverBox = new THREE.Mesh(
+      new THREE.BoxGeometry(1.8, 1.1, 2.2),
+      new THREE.MeshBasicMaterial({ color: 0xffcc00 })
+    );
+    roverBox.position.copy(this.gridToWorld(dropC, dropR, 1.1));
+    this.roverDropGroup.add(roverBox);
+
+    const badge = this.createBadgeSprite("🛞 ROVER BASECAMP", "#ffcc00");
+    badge.scale.set(7.5, 1.9, 1);
+    badge.position.copy(this.gridToWorld(dropC, dropR, 3.6));
+    this.roverDropGroup.add(badge);
+    this.roverRouteMesh.visible = !this.povMode;
+    this.roverDropGroup.visible = !this.povMode;
+  }
+
+  /**
+   * Rebuilds the route (and rover) tube meshes and the target marker from activePathIndices:
+   * tube radius 0.30 (0.065 in POV), lifted 0.45 (0.12 in POV) above the surface.
+   */
   private rebuildActiveRouteTube(): void {
     if (this.routeMesh) {
-      this.routeMesh.geometry.dispose();
+      this.disposeObject(this.routeMesh);
       this.scene.remove(this.routeMesh);
       this.routeMesh = null;
     }
     if (this.roverRouteMesh) {
-      this.roverRouteMesh.geometry.dispose();
+      this.disposeObject(this.roverRouteMesh);
       this.scene.remove(this.roverRouteMesh);
       this.roverRouteMesh = null;
     }
-    this.roverDropGroup.clear();
+    this.disposeGroup(this.roverDropGroup);
     if (this.activePathIndices.length < 2) return;
+    this.buildRoverLeg();
 
     const { gridSize } = this.sector;
     const heightOffset = this.povMode ? 0.12 : 0.45;
@@ -710,22 +855,29 @@ export class Scene3DHarness {
   }
 
   public clearRoute(): void {
+    this.activeRoverIndices = new Int32Array(0);
+    if (this.roverRouteMesh) {
+      this.disposeObject(this.roverRouteMesh);
+      this.scene.remove(this.roverRouteMesh);
+      this.roverRouteMesh = null;
+    }
+    this.disposeGroup(this.roverDropGroup);
     if (this.routeMesh) {
-      this.routeMesh.geometry.dispose();
+      this.disposeObject(this.routeMesh);
       this.scene.remove(this.routeMesh);
       this.routeMesh = null;
     }
     if (this.naiveRouteMesh) {
-      this.naiveRouteMesh.geometry.dispose();
+      this.disposeObject(this.naiveRouteMesh);
       this.scene.remove(this.naiveRouteMesh);
       this.naiveRouteMesh = null;
     }
     if (this.strataCurtainMesh) {
-      this.strataCurtainMesh.geometry.dispose();
+      this.disposeObject(this.strataCurtainMesh);
       this.scene.remove(this.strataCurtainMesh);
       this.strataCurtainMesh = null;
     }
-    this.cepRingGroup.clear();
+    this.disposeGroup(this.cepRingGroup);
     this.activeCurve = null;
     this.activePathIndices = new Int32Array(0);
     this.activePathCep = new Float32Array(0);
@@ -749,6 +901,11 @@ export class Scene3DHarness {
     this.autoWalkActive = active;
   }
 
+  /**
+   * Switches between orbital and first-person visor mode. Entering requires an active route; it
+   * saves the orbital camera, disables OrbitControls, applies the dusty POV fog / background, shrinks
+   * markers to 0.28 x and hides CEP rings / curtain / naive route. Leaving restores all of it.
+   */
   public setPovMode(enabled: boolean): void {
     if (enabled && !this.hasActiveRoute()) return;
     if (enabled && !this.povMode) {
@@ -833,6 +990,15 @@ export class Scene3DHarness {
     return this.routeProgress;
   }
 
+  /**
+   * Moves the astronaut marker / POV camera to arc-length fraction u = clamp(progress, 0, 0.992) of the
+   * route curve and looks at u + 0.065. In POV it also emits the VisorTelemetrySample:
+   *     heading = (round(atan2(dx, -dz) * 180/pi) + 360) mod 360, cardinal = round(heading/45) mod 8
+   *     node = pathIndices[floor(u * (n-1))]  (nearest route node, used for all cell look-ups)
+   *     nav mode: UHF LOS -> "UHF RANGING LOCK"; else >= 2 visible landmarks -> "SKYLINE TRIANGULATION";
+   *               else "IMU DEAD RECKONING DRIFT" (the displayed CEP is the pathfinder's per-node value).
+   * @param snap  true -> jump (no smoothing)
+   */
   private updateCameraAlongRoute(snap = false): void {
     if (!this.activeCurve || this.activePathIndices.length < 2) {
       this.onVisorUpdate?.(null);
@@ -923,6 +1089,19 @@ export class Scene3DHarness {
     }
   }
 
+  /**
+   * Paints per-vertex colours for the selected layer (HSL) and dims shaded cells by 0.52 in every
+   * layer except solar / walkback / discovery:
+   *     mars      t = clamp((z * vScale + 8) / 22, 0, 1);  H = 0.05 + 0.03 t, S = .65, L = .28 + .36 t
+   *     slope     hazard = min(slope / 35, 1);  hue = (1 - hazard) * 0.33  (green -> red)
+   *     sand      safe = clamp((TIU - 50) / 280, 0, 1);  hue = 0.58 - 0.45 safe
+   *     roughness min(sigma / 0.9, 1) -> green..red
+   *     radiation exposure = clamp((SVF - 0.45) / 0.55, 0, 1)  (open sky = hot)
+   *     solar / comms: binary palettes (lit vs shadow, link vs blackout)
+   *     walkback  Infinity = near black; |W - 95| <= 2.4 L = white ring (Point of No Return);
+   *               |W - 47.5| <= 1.5 L = cyan ring (half-budget); W < 95 green->red by W/95; beyond = dark red
+   *     discovery score > 55 emerald->gold ramp, 20..55 teal-blue ramp, else dark
+   */
   public applyHeatmap(mode: LayerMode): void {
     this.currentMode = mode;
     const c = new THREE.Color();
@@ -1011,6 +1190,11 @@ export class Scene3DHarness {
     return this.currentMode;
   }
 
+  /**
+   * Moves the DirectionalLight with the same parametrisation as the shadow solver:
+   * a = (solHour - 6)/12 * pi; position = (100 cos a, max(8, 100 sin a), 35). Only the light for
+   * rendering: the routed shadow mask comes from recomputeSolarShadow (which floors the sun at 12, not 8).
+   */
   public setSolHour(solHour: number): void {
     const angle = ((solHour - 6) / 12) * Math.PI;
     this.sunLight.position.set(
@@ -1020,6 +1204,11 @@ export class Scene3DHarness {
     );
   }
 
+  /**
+   * Registers the pointer-down handler: ray-casts the terrain mesh, converts the hit to (col,row) by
+   * round(((x + 50)/100) * (N-1)) (same for z), clamps to 1..N-2 and calls back with Shift state
+   * (Shift+Click = hazard toggle in main.ts). Ignored in POV mode and for non-left buttons.
+   */
   public onTerrainClick(
     callback: (col: number, row: number, shiftKey: boolean) => void
   ): void {
@@ -1043,6 +1232,10 @@ export class Scene3DHarness {
     });
   }
 
+  /**
+   * requestAnimationFrame loop. dt is clamped to 0.1 s. In POV with auto-walk, progress += 0.045 * dt
+   * per frame and wraps to 0 at 1; otherwise OrbitControls are updated (damping on).
+   */
   public startRenderLoop(onProgressTick?: (pct: number) => void): void {
     let lastTime = performance.now();
     const animate = (now: number) => {
